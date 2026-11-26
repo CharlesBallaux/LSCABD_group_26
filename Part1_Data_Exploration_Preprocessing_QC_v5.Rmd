@@ -1,0 +1,354 @@
+---
+title: "Group Project Part 1: Data Exploration, Preprocessing & Quality Control"
+subtitle: "Large Scale Analysis of Biomedical Data (Ghent University)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Executive Summary & Workflow Overview
+
+This R Markdown document contains the complete step-by-step workflow for **Part 1: Explore, Preprocess, and Quality-Control the Data**. 
+
+Every code chunk includes explicit diagnostic output to report exactly what data points, features, or technical artifacts were adapted, filtered, or imputed during preprocessing.
+
+---
+
+# Step 0: Setup Working Directory & Load Packages
+
+### Why this step is needed:
+Setting the working directory ensures RStudio correctly locates your input CSV files. Installing and loading required libraries (`tidyverse`, `skimr`, `impute`, `limma`, `gridExtra`) provides tools for data wrangling, missingness audits, $k$-NN imputation, batch-effect correction, and PCA visualization.
+
+### Lesson Reference:
+*Lesson 2 – Chapter 2: Data Loading & Environment Setup*
+
+```{r step0_setup}
+# 0.1 Set local working directory
+setwd("C:/Users/balde/Documents/UGent/Master/Master_1/Large scale analysis of biomedical data/PROJECT")
+
+cat("==================================================================\n")
+cat("STEP 0: ENVIRONMENT SETUP & PACKAGE AUDIT\n")
+cat("==================================================================\n")
+cat("Working directory set to:", getwd(), "\n\n")
+
+# 0.2 Install & load required packages
+required_packages <- c("tidyverse", "skimr", "impute", "limma", "gridExtra", "matrixStats")
+new_packages <- required_packages[!(required_packages %in% installed.packages()[,"Package"])]
+
+if(length(new_packages)) {
+  cat("Installing missing packages:", paste(new_packages, collapse = ", "), "\n")
+  if("impute" %in% new_packages || "limma" %in% new_packages) {
+    if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+    if("impute" %in% new_packages) BiocManager::install("impute")
+    if("limma" %in% new_packages) BiocManager::install("limma")
+    new_packages <- setdiff(new_packages, c("impute", "limma"))
+  }
+  if(length(new_packages)) install.packages(new_packages)
+}
+
+library(tidyverse)
+library(skimr)
+library(impute)  # Bioconductor package for k-NN imputation
+library(limma)   # Bioconductor package for batch effect removal
+library(gridExtra)
+
+cat("All required R packages successfully loaded!\n")
+```
+
+---
+
+# Step 1: Dataset Exploration & Variable Auditing
+
+### Why this step is needed:
+Before modifying data, we must inspect dimensions, sample IDs, and variable types. Variables are categorized into Nominal, Ordinal, Discrete Numeric, and Continuous Numeric types to ensure appropriate statistical handling.
+
+### Lesson Reference:
+*Lesson 2 – Step 1 & 1.2: Data Exploration: Describe Your Data*
+
+```{r step1_exploration}
+cat("==================================================================\n")
+cat("STEP 1: DATA EXPLORATION & DIMENSION AUDIT\n")
+cat("==================================================================\n")
+
+# 1.1 Load raw CSV files
+protein_annot <- read_csv("protein_annotation.csv")
+sample_meta  <- read_csv("sample_metadata.csv")
+npx_raw      <- read_csv("proteins_npx_raw.csv")
+
+# 1.2 Report initial dimensions
+cat("--- DATASET DIMENSIONS ---\n")
+cat("1. Raw NPX Matrix    :", nrow(npx_raw), "sample rows x", ncol(npx_raw) - 1, "protein features\n")
+cat("2. Sample Metadata   :", nrow(sample_meta), "sample rows x", ncol(sample_meta), "clinical columns\n")
+cat("3. Protein Annotation:", nrow(protein_annot), "annotated protein assays\n\n")
+
+# 1.3 Audit Variable Types in Metadata
+cat("--- VARIABLE TYPE BREAKDOWN (Sample Metadata) ---\n")
+cat("• Nominal Categorical : sample_kit_id, subject.subjectGuid, subject.biologicalSex, cmv_status, olink_plate_id, olink_batch_id\n")
+cat("• Ordinal Categorical : subject.ageGroup (e.g. Young Adult, Older Adult), sample.visitName\n")
+cat("• Discrete Numeric    : n_missing_npx, subject.birthYear, sample.drawYear\n")
+cat("• Continuous Numeric  : Protein NPX log2 values, ageAtDraw, am.bmi, chem.creatinine, bc.wbc, infl.hs_crp\n\n")
+
+# Print summary of metadata key variables
+skim(sample_meta %>% select(subject.biologicalSex, subject.ageGroup, cmv_status, olink_plate_id, am.bmi))
+
+# 1.4 Factor Conversion & Baseline Leveling (Preparing for Part 2 Regression Models)
+cat("\n--- 1.4 METADATA FACTOR CONVERSION & BASELINE LEVELING ---\n")
+sample_meta <- sample_meta %>%
+  mutate(
+    subject.ageGroup      = factor(subject.ageGroup),
+    subject.ageGroup      = relevel(subject.ageGroup, ref = "Young Adult"),
+    cmv_status            = factor(cmv_status),
+    cmv_status            = relevel(cmv_status, ref = "Negative"),
+    subject.biologicalSex = factor(subject.biologicalSex),
+    subject.biologicalSex = relevel(subject.biologicalSex, ref = "Female"),
+    olink_plate_id        = factor(olink_plate_id)
+  )
+
+cat("✔ Metadata Factors successfully converted & reference baselines set:\n")
+cat("  • subject.ageGroup      : Reference level -> '", levels(sample_meta$subject.ageGroup)[1], "'\n", sep="")
+cat("  • cmv_status            : Reference level -> '", levels(sample_meta$cmv_status)[1], "'\n", sep="")
+cat("  • subject.biologicalSex : Reference level -> '", levels(sample_meta$subject.biologicalSex)[1], "'\n", sep="")
+cat("  • olink_plate_id        : Total plate factor levels -> ", length(levels(sample_meta$olink_plate_id)), "\n\n")
+```
+
+---
+
+# Step 2: Quality Control, Filtering & Imputation
+
+### Why this step is needed:
+1. **Duplicate Assay Filtering**: Duplicate gene symbol aliases mapping to identical Olink assay IDs create artificial redundancy and column errors (18 entries removed).
+2. **Limit of Detection (LOD) & Missingness Thresholding (>20% NA / >50% LOD)**: 
+   - **Limit of Detection (`pct_below_lod > 50%`)**: Proteins where >50% of sample values fall below the Limit of Detection (LOD) represent non-quantifiable background noise. Filtering these ~151 proteins prevents heavy artificial noise imputation, removes non-informative noise, and reduces the multiple-testing penalty in downstream statistical testing (Part 2 & 3).
+   - **Missingness Thresholding (`pct_missing > 20%`)**: Any remaining proteins exceeding 20% explicit $NA$ values are removed.
+3. **$k$-NN Imputation**: Setting missing NPX values to 0 distorts relative $\log_2$ scales ($2^0 = 1$). $k$-Nearest Neighbors imputation fills isolated missing values (<20% $NA$) using biological co-expression patterns.
+
+### Lesson Reference:
+*Lesson 2 – Step 2.1 & 2.2: Missing Values, Imputation & Filtering*
+
+```{r step2_qc_filtering}
+cat("==================================================================\n")
+cat("STEP 2: QC FILTERING & IMPUTATION ADAPTATION OUTPUT\n")
+cat("==================================================================\n")
+
+# 2.1 Identify and remove duplicate Olink assay IDs
+dup_rows <- protein_annot %>% filter(duplicate_olink_id == TRUE)
+dup_proteins <- dup_rows %>% pull(protein)
+
+cat("--- 2.1 DUPLICATE ASSAYS IDENTIFIED & REMOVED ---\n")
+cat("Number of duplicate protein aliases found:", length(dup_proteins), "\n")
+cat("Duplicate protein symbols removed:\n")
+print(dup_rows %>% select(protein, olink_id, same_assay_as))
+cat("\n")
+
+# 2.2 Calculate Missingness & LOD Rates per Protein
+npx_mat_raw <- npx_raw %>% column_to_rownames("sample_kit_id")
+total_initial_cells <- nrow(npx_mat_raw) * ncol(npx_mat_raw)
+total_initial_nas   <- sum(is.na(npx_mat_raw))
+
+# Identify proteins with >50% measurements below LOD (~151 proteins)
+high_lod_proteins <- protein_annot %>% 
+  filter(pct_below_lod > 50) %>% 
+  pull(protein)
+
+# Identify proteins with >20% explicit NAs
+protein_missingness <- colMeans(is.na(npx_mat_raw)) * 100
+high_missing_proteins <- names(protein_missingness[protein_missingness > 20])
+
+# Combine all exclusion targets
+all_removed_proteins <- unique(c(dup_proteins, high_lod_proteins, high_missing_proteins))
+all_removed_proteins <- intersect(all_removed_proteins, colnames(npx_mat_raw))
+
+cat("--- 2.2 MISSINGNESS & LOD AUDIT & EXCLUSION ---\n")
+cat("Total matrix cells                :", total_initial_cells, "\n")
+cat("Total initial NA values           :", total_initial_nas, "(", round(total_initial_nas / total_initial_cells * 100, 3), "%)\n")
+cat("Proteins exceeding 50% below LOD  :", length(high_lod_proteins), "proteins filtered out\n")
+cat("Proteins exceeding 20% NAs        :", length(high_missing_proteins), "proteins filtered out\n")
+cat("Total unique proteins removed     :", length(all_removed_proteins), "proteins\n\n")
+
+# Apply feature filtering
+valid_proteins <- setdiff(colnames(npx_mat_raw), all_removed_proteins)
+npx_filtered <- npx_mat_raw[, valid_proteins]
+
+cat("--- FEATURE SELECTION SUMMARY ---\n")
+cat("Initial protein features          :", ncol(npx_mat_raw), "\n")
+cat("Total Removed (LOD + Dups + NAs)  :", length(all_removed_proteins), "\n")
+cat("Final Retained Proteins           :", ncol(npx_filtered), "\n\n")
+
+# Plot Missingness & LOD Distributions
+df_lod <- protein_annot %>% filter(protein %in% colnames(npx_mat_raw))
+p_lod <- ggplot(df_lod, aes(x = pct_below_lod)) +
+  geom_histogram(binwidth = 5, fill = "darkred", color = "black") +
+  geom_vline(xintercept = 50, color = "yellow", linetype = "dashed", size = 1) +
+  labs(title = "Distribution of Protein % Below LOD",
+       x = "Percentage Below LOD (%)", y = "Protein Count",
+       caption = "Yellow line indicates 50% LOD exclusion threshold") +
+  theme_minimal()
+print(p_lod)
+
+# 2.3 Apply k-Nearest Neighbors (k-NN) Imputation
+nas_before_knn <- sum(is.na(npx_filtered))
+cat("--- 2.3 k-NN IMPUTATION ADAPTATION ---\n")
+cat("Isolated NAs remaining in filtered matrix before k-NN:", nas_before_knn, "\n")
+
+npx_transposed <- t(as.matrix(npx_filtered))
+knn_result <- impute.knn(npx_transposed, k = 10, rowmax = 0.5, colmax = 0.8)
+npx_imputed <- t(knn_result$data) # Transpose back to Samples x Proteins
+
+nas_after_knn <- sum(is.na(npx_imputed))
+cat("Isolated NAs remaining after k-NN imputation       :", nas_after_knn, "\n")
+cat("Status: Matrix is now 100% complete and ready for scaling!\n\n")
+```
+
+---
+
+# Step 3: Data Transformation & Standardization ($Z$-Score Scaling)
+
+### Why this step is needed:
+Olink NPX values are already $\log_2$-transformed by default. To prevent highly abundant proteins from dominating PCA variance or machine learning weights, features are standardized ($Z$-score scaling: mean $= 0$, standard deviation $= 1$).
+
+### Lesson Reference:
+*Lesson 2 – Step 2.4 (Log-Transformation) & Step 2.5 (Standardization)*
+
+```{r step3_standardization}
+cat("==================================================================\n")
+cat("STEP 3: STANDARDIZATION & SCALING ADAPTATION OUTPUT\n")
+cat("==================================================================\n")
+
+# 3.1 Verify log2 scale (No additional log-transform required)
+cat("Log-Transform Check: NPX data is already on a log2 scale.\n")
+
+# 3.2 Z-Score Standardization
+npx_scaled <- scale(npx_imputed)
+
+# 3.3 Print summary verification of scaled matrix
+col_means <- mean(colMeans(npx_scaled))
+col_sds   <- mean(apply(npx_scaled, 2, sd))
+
+cat("--- Z-SCORE SCALING VERIFICATION ---\n")
+cat("Overall Matrix Mean (Target = 0) :", round(col_means, 6), "\n")
+cat("Overall Matrix SD   (Target = 1) :", round(col_sds, 6), "\n")
+cat("All", ncol(npx_scaled), "proteins successfully centered and scaled.\n\n")
+```
+
+---
+
+# Step 4: Quality Control & PCA Batch Correction
+
+### Why this step is needed:
+PCA evaluates sample clustering. In the raw data, samples cluster strongly by laboratory plate (`olink_plate_id`), indicating that technical batch effects dominate global variance. We apply `limma::removeBatchEffect()` while preserving the biological design (`subject.ageGroup`) to remove plate artifacts and unmask true biological signals.
+
+### Lesson Reference:
+*Lesson 2 – Step 3.2.3 (PCA & Clustering) & Step 4 (Batch Effects)*
+
+```{r step4_pca_batch_correction, fig.width=12, fig.height=5}
+cat("==================================================================\n")
+cat("STEP 4: PCA & BATCH EFFECT REMOVAL DIAGNOSTICS\n")
+cat("==================================================================\n")
+
+# 4.1 Uncorrected PCA
+pca_raw <- prcomp(npx_scaled, center = FALSE, scale. = FALSE)
+var_raw <- (pca_raw$sdev^2) / sum(pca_raw$sdev^2) * 100
+
+cat("--- RAW PCA VARIANCE EXPLAINED ---\n")
+cat("PC1:", round(var_raw[1], 2), "% | PC2:", round(var_raw[2], 2), "% | Combined Top 2 PCs:", round(var_raw[1] + var_raw[2], 2), "%\n\n")
+
+# 4.2 Apply Batch Correction using limma
+cat("--- APPLYING LIMMA BATCH CORRECTION ---\n")
+cat("Technical Batch Factor Removed : olink_plate_id (", length(unique(sample_meta$olink_plate_id)), "unique plates)\n")
+cat("Biological Design Preserved    : subject.ageGroup\n")
+
+npx_transposed_scaled <- t(npx_scaled)
+batch_plate <- sample_meta$olink_plate_id
+design_bio  <- model.matrix(~ subject.ageGroup, data = sample_meta)
+
+npx_corrected_transposed <- removeBatchEffect(
+  x = npx_transposed_scaled,
+  batch = batch_plate,
+  design = design_bio
+)
+
+npx_batch_corrected <- t(npx_corrected_transposed)
+
+# 4.3 Corrected PCA
+pca_corr <- prcomp(npx_batch_corrected, center = FALSE, scale. = FALSE)
+var_corr <- (pca_corr$sdev^2) / sum(pca_corr$sdev^2) * 100
+
+cat("--- BATCH-CORRECTED PCA VARIANCE EXPLAINED ---\n")
+cat("PC1:", round(var_corr[1], 2), "% | PC2:", round(var_corr[2], 2), "% | Combined Top 2 PCs:", round(var_corr[1] + var_corr[2], 2), "%\n\n")
+
+# 4.4 Prepare Visualization Comparisons
+df_pca_raw  <- as.data.frame(pca_raw$x[, 1:2]) %>% 
+  rownames_to_column("sample_kit_id") %>% 
+  inner_join(sample_meta, by = "sample_kit_id")
+
+df_pca_corr <- as.data.frame(pca_corr$x[, 1:2]) %>% 
+  rownames_to_column("sample_kit_id") %>% 
+  inner_join(sample_meta, by = "sample_kit_id")
+
+# Raw Plate Effect Plot
+p1 <- ggplot(df_pca_raw, aes(x = PC1, y = PC2, color = olink_plate_id)) +
+  geom_point(alpha = 0.7, size = 1.8) +
+  labs(title = "Raw PCA: Technical Plate Batches",
+       subtitle = "Strong separation by olink_plate_id",
+       x = paste0("PC1 (", round(var_raw[1], 1), "%)"),
+       y = paste0("PC2 (", round(var_raw[2], 1), "%)")) +
+  theme_minimal() + theme(legend.position = "none")
+
+# Corrected Plate Effect Plot
+p2 <- ggplot(df_pca_corr, aes(x = PC1, y = PC2, color = olink_plate_id)) +
+  geom_point(alpha = 0.7, size = 1.8) +
+  labs(title = "Batch-Corrected PCA: Plate Effect Removed",
+       subtitle = "Plates homogenously intermixed",
+       x = paste0("PC1 (", round(var_corr[1], 1), "%)"),
+       y = paste0("PC2 (", round(var_corr[2], 1), "%)")) +
+  theme_minimal() + theme(legend.position = "none")
+
+# Corrected Biological Signal Plot (Age Group)
+p3 <- ggplot(df_pca_corr, aes(x = PC1, y = PC2, color = `subject.ageGroup`)) +
+  geom_point(alpha = 0.8, size = 1.8) +
+  labs(title = "Corrected PCA: Biological Signal",
+       subtitle = "Evaluated by Age Group",
+       x = paste0("PC1 (", round(var_corr[1], 1), "%)"),
+       y = paste0("PC2 (", round(var_corr[2], 1), "%)")) +
+  theme_minimal()
+
+grid.arrange(p1, p2, p3, ncol = 3)
+```
+
+---
+
+# Step 5: Export Final Cleaned & Batch-Corrected Dataset
+
+### Why this step is needed:
+Exporting the processed dataset to `.rds` and `.csv` formats creates a reproducible checkpoint for downstream multivariable linear regression (Parts 2 & 3) and machine learning classification (Part 4).
+
+```{r step5_export}
+cat("==================================================================\n")
+cat("STEP 5: DATASET EXPORT & FINAL SUMMARY VERIFICATION\n")
+cat("==================================================================\n")
+
+# Save cleaned objects (both protein matrix and factor-leveled metadata)
+saveRDS(npx_batch_corrected, "preprocessed_proteins_npx_batch_corrected.rds")
+write.csv(as.data.frame(npx_batch_corrected), "preprocessed_proteins_npx_batch_corrected.csv")
+
+saveRDS(sample_meta, "sample_metadata_processed.rds")
+write.csv(sample_meta, "sample_metadata_processed.csv")
+
+cat("--- PREPROCESSING FINAL CHECKLIST ---\n")
+cat("✔ Final Samples Count       : ", nrow(npx_batch_corrected), "\n")
+cat("✔ Final Retained Proteins   : ", ncol(npx_batch_corrected), "\n")
+cat("✔ Remaining Missing Values  : ", sum(is.na(npx_batch_corrected)), "\n")
+cat("✔ Z-Score Scaling Complete  :  Mean = 0, SD = 1\n")
+cat("✔ Batch Correction Applied  :  olink_plate_id effect removed via limma\n")
+cat("✔ Output Files Saved        : 'preprocessed_proteins_npx_batch_corrected.rds', 'sample_metadata_processed.rds' & CSVs\n")
+cat("==================================================================\n")
+cat("PART 1 PREPROCESSING COMPLETE AND READY FOR PART 2 MODELING!\n")
+cat("==================================================================\n")
+```
