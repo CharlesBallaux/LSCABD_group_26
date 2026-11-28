@@ -1,0 +1,618 @@
+---
+title: "Part 1 — Exploration, preprocessing and quality control"
+subtitle: "LSABD group project · Olink-age dataset (Gong et al., Nature 2025)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 4.2, dpi = 130)
+```
+
+# Read this first (summary for the group)
+
+**Goal of part 1** (slide 20): get the dataset ready for analysis, find and handle quality problems, and document every choice.
+
+**Principles used, so the preprocessing is unbiased and independent of any hypothesis:**
+
+1. **No filter uses the group labels** (age group, sex, CMV, visit). Filters only use technical information (detection limit, missingness). This is what part 3 requires, and it means the cleaned data can be used for *any* hypothesis we choose later.
+2. **No invented values.** Missing values are explained, not imputed.
+3. **The exported data are not batch-corrected and not standardised.** Batch correction and z-scores are used for the PCA and heatmap only. For statistical tests, batch goes into the model as a covariate (explained in step 8).
+
+**Decisions at a glance**
+
+| Step | Finding | Decision | Effect |
+|---|---|---|---|
+| 1 | Data and metadata IDs match, same order | none needed | 867 samples |
+| 1 | Odd values on slide 7 come from Excel | read CSVs in R, never via Excel | values correct |
+| 2 | 96 donors, ~9 samples each | keep all samples here; choose time point/model per analysis | N = donors, not samples |
+| 3 | 9 proteins appear under an old and a new name (same assay) | merge each pair | 1481 → 1472 proteins |
+| 4 | 21 proteins missing within one batch only | not imputed | NA kept |
+| 5 | 150 proteins > 50% below detection limit | removed (label-independent) | 1472 → 1322 proteins |
+| 6 | No outlier samples | keep all | 867 samples |
+| 7 | PCA: samples cluster by **batch**, not biology | — | batch = largest source of variation |
+| 8 | Batch partly confounded with age | batch as covariate in all models; no correction of exported data | |
+
+**Output files** (step 9): `npx_clean.csv` (867 samples × 1322 proteins, NPX), `metadata_clean.csv`, `removed_proteins.csv`.
+
+**Before running:** put this .Rmd in the same folder as the three CSV files. No `setwd()` is needed, so it runs on every computer.
+
+# Step 0 — Setup
+
+**What the code does:** loads the packages (readr = reading CSVs, dplyr/tidyr = working with tables, ggplot2 = plots, patchwork = combining plots, scales = axis labels) and sets one plot style for all figures. Each variable gets its **own fixed colours** (age group = blue/orange, sex = pink/green, CMV = teal/yellow), so a colour never means two different things in different panels.
+
+```{r packages}
+library(readr); library(dplyr); library(tidyr); library(ggplot2); library(patchwork); library(scales)
+
+pal <- c("#257de0", "#f47230", "#00b894", "#f2a600", "#ee7fac", "#008a17")
+# one fixed meaning per colour pair, used in every figure
+age_cols <- c(`Older Adult` = "#257de0", `Young Adult` = "#f47230")
+sex_cols <- c(Female = "#ee7fac", Male = "#008a17")
+cmv_cols <- c(Negative = "#00b894", Positive = "#f2a600")
+theme_set(theme_minimal(base_size = 11) +
+          theme(panel.grid.minor = element_blank(),
+                plot.title = element_text(face = "bold", size = 12),
+                plot.title.position = "plot", legend.position = "bottom"))
+```
+
+# Step 1 — Load the files and check the structure
+
+**Why:** check what we have, and that measurements and metadata belong to the same samples in the same order. If not, protein values get linked to the wrong person without any error message.
+
+**The three files**
+
+- `proteins_npx_raw.csv`: the **measurements**, one row per blood sample, one column per protein (NPX values).
+- `sample_metadata.csv`: **information about each sample**: donor, age, sex, visit, Olink batch/plate, BMI, clinical lab values.
+- `protein_annotation.csv`: **information about each protein**: panel, % of samples below the detection limit.
+
+The link between measurements and metadata is `sample_kit_id`.
+
+**What the code does**
+
+- `read_csv()` reads each file and keeps column names exactly as they are (e.g. `HLA-DRA`).
+- `as.matrix(proteins_npx_raw[, -1])` drops the ID column and keeps a matrix of **numbers only**. A matrix holds one data type; with the text ID inside, everything would become text and no calculation would work. The IDs move to the row names, so each row keeps its label.
+- The checks: `setequal()` = same IDs; `all(a == b)` = same order; `range()` = lowest and highest value (`na.rm = TRUE` skips missing values *for this calculation only*, nothing is deleted).
+
+```{r load}
+proteins_npx_raw   <- read_csv("proteins_npx_raw.csv")
+sample_metadata    <- read_csv("sample_metadata.csv")
+protein_annotation <- read_csv("protein_annotation.csv")
+
+npx <- as.matrix(proteins_npx_raw[, -1])
+rownames(npx) <- proteins_npx_raw$sample_kit_id
+meta <- as.data.frame(sample_metadata)
+ann  <- as.data.frame(protein_annotation); rownames(ann) <- ann$protein
+
+data.frame(
+  check  = c("samples x protein columns", "metadata columns", "annotated proteins",
+             "same sample IDs in data and metadata", "same order", "protein columns = annotation",
+             "lowest NPX", "highest NPX"),
+  result = c(paste(dim(npx), collapse = " x "), ncol(meta), nrow(ann),
+             setequal(rownames(npx), meta$sample_kit_id),
+             all(rownames(npx) == meta$sample_kit_id),
+             setequal(colnames(npx), ann$protein),
+             min(npx, na.rm = TRUE), max(npx, na.rm = TRUE)))
+
+stopifnot(all(rownames(npx) == meta$sample_kit_id))   # stop here if the order were ever wrong
+round(npx[1:5, 1:6], 3)
+```
+
+**Reading this:** 867 samples × 1481 protein columns; all checks pass. AARSD1 is around 2–3.
+
+**About the odd values on slide 7** (AARSD1 = 23.968): the file has 2.3968. Excel in a Belgian setting reads `.` as a thousands separator. **Decision:** always read the CSVs in R (or Python).
+
+**About NPX** (paper, Methods "Olink analysis"):
+
+- **Normalised** by the data producer: corrected with an internal control in every well and with reference plasma on every plate, so technical lab variation is reduced. We do not normalise again.
+- **log2 scale:** +1 NPX ≈ twice as much protein. We do not log-transform again.
+- **Relative:** every protein has its own antibody pair and its own arbitrary zero point. Compare *one protein between samples*, never two proteins with each other.
+
+**Why 1481 columns, not 1472?** 9 proteins appear under two names (step 3).
+
+# Step 2 — Study design and the real N
+
+**Why:** repeated samples of one person are not independent (pseudoreplication, lesson 1). We need the number of **people**, and how they are spread over groups and visits. We also check whether the groups are balanced on sex, CMV and BMI, because an imbalance can confound any comparison (lesson 1).
+
+**What the code does**
+
+- `length(unique(...))` counts donors.
+- `!duplicated(...)` keeps one row per donor, so the tables count **people**, not samples.
+- BMI is measured at most visits; per donor we take the **median BMI over all visits** (BMI barely changes within a person).
+
+```{r design-numbers}
+cat("donors:", length(unique(meta$subject.subjectGuid)), "\n")
+table(samples_per_donor = table(meta$subject.subjectGuid))
+
+donors <- meta[!duplicated(meta$subject.subjectGuid), ]
+bmi_donor <- tapply(meta$am.bmi, meta$subject.subjectGuid, median, na.rm = TRUE)
+donors$bmi_donor_median <- as.numeric(bmi_donor[donors$subject.subjectGuid])
+
+donors %>% group_by(subject.ageGroup) %>%
+  summarise(donors = n(),
+            age_range = paste(min(subject.ageAtFirstDraw), "-", max(subject.ageAtFirstDraw)),
+            pct_female = round(mean(subject.biologicalSex == "Female") * 100),
+            pct_CMV_pos = round(mean(cmv_status == "Positive") * 100),
+            BMI_mean = round(mean(bmi_donor_median, na.rm = TRUE), 1),
+            BMI_missing = sum(is.na(bmi_donor_median)))
+```
+
+**What the code does (figures):** bar charts count donors per combination of age group and sex/CMV; a boxplot compares BMI between age groups; the last panel counts **samples** per visit.
+
+```{r design-plots, fig.height = 7.5}
+pA <- donors %>% count(subject.ageGroup, subject.biologicalSex) %>%
+  ggplot(aes(subject.ageGroup, n, fill = subject.biologicalSex)) +
+  geom_col(position = position_dodge(0.8), width = 0.75) +
+  geom_text(aes(label = n), position = position_dodge(0.8), vjust = -0.4, size = 3.3) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  scale_fill_manual(values = sex_cols) + labs(title = "A  Donors: age group × sex", x = NULL, y = "donors", fill = NULL)
+
+pB <- donors %>% count(subject.ageGroup, cmv_status) %>%
+  ggplot(aes(subject.ageGroup, n, fill = cmv_status)) +
+  geom_col(position = position_dodge(0.8), width = 0.75) +
+  geom_text(aes(label = n), position = position_dodge(0.8), vjust = -0.4, size = 3.3) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  scale_fill_manual(values = cmv_cols) + labs(title = "B  Donors: age group × CMV", x = NULL, y = "donors", fill = NULL)
+
+pC <- ggplot(filter(donors, !is.na(bmi_donor_median)), aes(subject.ageGroup, bmi_donor_median)) +
+  geom_boxplot(fill = pal[1], alpha = 0.25, width = 0.5, outlier.shape = NA) +
+  geom_jitter(width = 0.12, size = 1.3, alpha = 0.7, color = pal[1]) +
+  labs(title = "C  BMI per donor", x = NULL, y = "BMI (median over visits)")
+
+visit_order <- c("Flu Year 1 Day 0", "Flu Year 1 Day 7", "Flu Year 1 Day 90",
+                 "Immune Variation Day 0", "Immune Variation Day 7", "Immune Variation Day 90",
+                 "Flu Year 2 Day 0", "Flu Year 2 Day 7", "Flu Year 2 Day 90",
+                 "Flu Year 1 Stand-Alone", "Flu Year 2 Stand-Alone", "Flu Year 3 Stand-Alone")
+pD <- meta %>% count(sample.visitName, subject.ageGroup) %>%
+  mutate(sample.visitName = factor(sample.visitName, levels = rev(visit_order))) %>%
+  ggplot(aes(n, sample.visitName, fill = subject.ageGroup)) +
+  geom_col(position = position_dodge(0.8), width = 0.75) +
+  scale_fill_manual(values = age_cols) + labs(title = "D  Samples per visit (colour = age group)", x = "samples", y = NULL, fill = NULL)
+
+(pA | pB | pC) / pD + plot_layout(heights = c(1, 1.4))
+```
+
+**Reading this**
+
+- **96 donors**, 77 with 10 samples, 19 with fewer (one donor has 1). Not fully balanced.
+- **Age:** young 25–36 y, older 55–65 y, with a gap in between, so age works best as **two groups**.
+- **Sex:** 57% women in both groups, balanced.
+- **CMV:** 53% positive in older vs 39% in young adults, a moderate imbalance: worth adjusting for when comparing age groups.
+- **BMI:** about 1.8 kg/m² higher in older adults on average; relevant for any model where BMI could affect the outcome.
+- **Visits:** Flu Year 1 and Flu Year 2 (vaccination: day 0, 7, 90), Immune Variation (same rhythm; the paper's design figure suggests a series **without** vaccine, to check in Fig. 1a) and irregular stand-alone visits.
+- **Stand-alone visits are unbalanced by age**: all 14 Flu Year 1 stand-alone samples are from older adults. Leave them out of age comparisons.
+- **Flu Year 1 Day 0** has 92 samples from 92 different donors: one sample per person, before any vaccine.
+
+**Decision:** keep all 867 samples in the cleaned data. Each later analysis must handle the repeated samples itself: one time point per donor (e.g. Flu Year 1 Day 0), an average per donor, or a mixed model.
+
+**Variable types (slide 20, question 1)**
+
+| Type | Meaning | Variables |
+|---|---|---|
+| nominal | categories without order | sex, CMV status, race, ethnicity, **batch and plate ID**, donor ID |
+| ordinal | categories with order | age group (young < older); day 0 < 7 < 90 within a series |
+| discrete | whole-number counts | `n_missing_npx`, samples per donor, birth year |
+| continuous | values on a scale | NPX, BMI, age, clinical lab values, % below LOD |
+
+Watch out: **batch IDs look like numbers but are nominal** (codes, not quantities). They are converted to factors in step 9. Sex, CMV and age group are binary (two levels).
+
+# Step 3 — Duplicate (renamed) proteins
+
+**Why:** 1481 protein columns, but the paper reports 1472 proteins. We search the annotation for Olink assay IDs that occur more than once, and check from the data whether such a pair is two separate measurements (both columns filled for the same samples) or one assay under two names (each sample filled under only one of the names).
+
+**What the code does (detecting the duplicates from the data)**
+
+- Part 1 searches the annotation for Olink IDs that occur more than once (`duplicated()` is TRUE for every repeat).
+- Part 2 checks per pair in how many samples **both** names have a value, and in how many **neither** has one. Both = 0 and neither = 0 means the two names fill complementary halves of the data: one assay under two names.
+- Part 3 shows in which batches each name has values.
+- Part 4 builds the old → new mapping from the data: the name measured in fewer samples (only the first batch) is the old name. Nothing is typed in by hand.
+
+```{r detect-duplicates}
+batch <- meta$olink_batch_id
+
+# 1. Which Olink IDs occur more than once in the annotation?
+dup_ids   <- unique(ann$olink_id[duplicated(ann$olink_id)])
+dup_pairs <- ann[ann$olink_id %in% dup_ids, c("olink_id", "protein")]
+dup_pairs <- dup_pairs[order(dup_pairs$olink_id), ]
+cat("Olink IDs that occur twice:", length(dup_ids), "| protein names involved:", nrow(dup_pairs), "\n")
+
+# 2. Per pair: in how many samples do BOTH names have a value, and in how many NEITHER?
+pair_check <- do.call(rbind, lapply(dup_ids, function(id) {
+  cols <- dup_pairs$protein[dup_pairs$olink_id == id]
+  n_measured <- colSums(!is.na(npx[, cols]))
+  data.frame(olink_id      = id,
+             name_A        = cols[1], measured_A = n_measured[1],
+             name_B        = cols[2], measured_B = n_measured[2],
+             both_measured = sum(rowSums(!is.na(npx[, cols])) == 2),
+             neither       = sum(rowSums(!is.na(npx[, cols])) == 0),
+             row.names = NULL)
+}))
+pair_check
+
+# 3. In which batches does each name have values?
+data.frame(protein = dup_pairs$protein,
+           batches_with_values = sapply(dup_pairs$protein, function(p)
+             paste(sort(unique(batch[!is.na(npx[, p])])), collapse = ", ")),
+           row.names = NULL)
+
+# 4. Build the old -> new mapping from the data (old name = measured in fewer samples)
+a_is_old   <- pair_check$measured_A < pair_check$measured_B
+old_to_new <- setNames(ifelse(a_is_old, pair_check$name_B, pair_check$name_A),
+                       ifelse(a_is_old, pair_check$name_A, pair_check$name_B))
+old_to_new
+```
+
+**Reading this:** 9 Olink IDs occur twice (18 names). In every pair one name is measured in 156 samples and the other in 711, with both = 0 and neither = 0: 156 + 711 = 867, so together they fill every sample exactly once. The 156-sample name only has values in batch 20201752.
+
+**What the code does (figure):** per batch, the % of samples in which each name has a value (blue = measured, grey = missing).
+
+```{r renamed-check, fig.height = 4.6}
+data.frame(npx[, c(names(old_to_new), old_to_new)], check.names = FALSE) %>%
+  mutate(batch = batch) %>%
+  pivot_longer(-batch, names_to = "protein", values_to = "npx") %>%
+  group_by(batch, protein) %>% summarise(pct_measured = mean(!is.na(npx)) * 100, .groups = "drop") %>%
+  mutate(name = ifelse(protein %in% names(old_to_new), "old name", "new name"),
+         pair = ifelse(protein %in% names(old_to_new), paste(protein, "/", old_to_new[protein]),
+                       paste(names(old_to_new)[match(protein, old_to_new)], "/", protein))) %>%
+  ggplot(aes(batch, name, fill = pct_measured)) +
+  geom_tile(color = "white", linewidth = 0.8) + facet_wrap(~ pair, ncol = 3) +
+  scale_fill_gradient(low = "#e6e6e6", high = pal[1], name = "% measured") +
+  labs(title = "Old name only in the first batch, new name in all later batches", x = "Olink batch", y = NULL) +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1, size = 8))
+```
+
+**Reading this:** the old name (e.g. CD97, WISP1) is used only in the first batch, the current name (e.g. ADGRE5, CCN4) in all later batches. It is **one assay, renamed** between data releases (the official gene names changed).
+
+**What the code does (merge):** `ifelse(is.na(new), old, new)` fills the empty cells of the new-name column with the old-name values; then the old-name columns are removed.
+
+```{r merge}
+X <- npx
+for (o in names(old_to_new)) {
+  n <- old_to_new[[o]]
+  X[, n] <- ifelse(is.na(X[, n]), X[, o], X[, n])
+}
+X <- X[, !colnames(X) %in% names(old_to_new)]
+cat("proteins:", ncol(X), "| missing values before:", sum(is.na(npx)), "| after:", sum(is.na(X)), "\n")
+```
+
+**Decision:** merge each pair under the current gene name → **1472 proteins**, exactly the number in the paper. Removing both names instead would lose 8 real proteins. The merge also removes about 75% of all missing values.
+
+*Note:* CXCL8, IL6 and TNF appear 4 times with **different** Olink IDs (one assay per panel). Those are real repeated measurements, already counted in the 1472. They are kept; whoever uses one of them later should state which panel's version is used.
+
+# Step 4 — Missing values: where and why
+
+**Why:** the type of missingness decides how to handle it (lesson 2: MCAR, MAR, MNAR).
+
+**What the code does:** `colSums(is.na(X)) > 0` finds proteins with at least one missing value; for those, the % missing **per batch** is drawn as a heatmap.
+
+```{r missing, fig.height = 5}
+miss_prot <- names(which(colSums(is.na(X)) > 0))
+cat("proteins with missing values:", length(miss_prot), "\n")
+
+data.frame(X[, miss_prot], check.names = FALSE) %>% mutate(batch = batch) %>%
+  pivot_longer(-batch, names_to = "protein", values_to = "npx") %>%
+  group_by(batch, protein) %>% summarise(pct_missing = mean(is.na(npx)) * 100, .groups = "drop") %>%
+  ggplot(aes(batch, reorder(protein, pct_missing), fill = pct_missing)) +
+  geom_tile(color = "white", linewidth = 0.6) +
+  geom_text(aes(label = ifelse(pct_missing > 0, round(pct_missing), "")), size = 2.8, color = "white") +
+  scale_fill_gradient(low = "#f2f2f2", high = "#b5361c", name = "% missing") +
+  labs(title = "Each protein is missing in one batch only", x = "Olink batch", y = NULL) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+**Reading this:** 15 proteins are missing in **all** samples of batch Q-04064; 6 (APP, CD177, GRN, MMP9, MPO, SERPINB1) in 26–79% of batch 20201752. All other batches are complete. The assay was not reported for that run or plate (technical, probably failed quality control).
+
+**Type of missingness:** not MCAR (it is fully predictable from batch) and not MNAR (it has nothing to do with the protein level). Closest to **MAR**, with batch as the explaining variable.
+
+**Decision:** **no imputation.** For 15 proteins an entire batch (144 samples) is missing; any imputed value would be invented, and it would inherit that batch's shift. Instead:
+
+- the values stay `NA` in the exported data;
+- for a test on one of these proteins, use the samples where it was measured (R's `lm()` does this automatically);
+- methods that cannot handle `NA` (PCA, most machine-learning models) leave these proteins out.
+
+# Step 5 — Detection-limit (LOD) filter
+
+**Why:** below the limit of detection Olink still reports a number, but it is mostly noise: the protein is too low to measure. This is **MNAR** (missing *because* the value is low). Mean imputation would be wrong here; a protein that is below the LOD in most samples carries little real signal.
+
+**What the code does**
+
+- `ann[colnames(X), "pct_below_lod"]` looks up the % of samples below the LOD for each protein (pre-computed in the annotation).
+- The histogram shows the distribution, with the cut-off as a dashed line (log y-axis, because most proteins are at 0%).
+- **Sensitivity count:** `sapply(cutoffs, function(c) sum(lod > c))` counts, for each possible cut-off, how many proteins lie above it (`lod > c` is TRUE/FALSE per protein; `sum` counts the TRUEs).
+- `cut()` puts each protein in a 10% band and `table()` counts the proteins per band. This shows whether there is an empty band (a natural gap) where the exact cut-off would hardly matter.
+
+```{r lod, fig.height = 3.8}
+lod <- ann[colnames(X), "pct_below_lod"]
+
+ggplot(data.frame(lod), aes(lod)) +
+  geom_histogram(binwidth = 2, boundary = 0, fill = pal[1], color = "white") +
+  geom_vline(xintercept = 50, linetype = "dashed") +
+  annotate("text", x = 52, y = 500, label = "cut-off 50%", hjust = 0, size = 3.5) +
+  scale_y_log10() +
+  labs(title = "Most proteins are always detected; a tail is mostly below the LOD",
+       x = "% of samples below LOD", y = "proteins (log scale)")
+
+# Sensitivity: how many proteins does each cut-off remove?
+cutoffs <- c(10, 20, 25, 30, 40, 50, 60, 70, 75, 90)
+data.frame(cutoff_pct_below_LOD = paste0("> ", cutoffs, "%"),
+           proteins_removed     = sapply(cutoffs, function(c) sum(lod > c)),
+           proteins_kept        = sapply(cutoffs, function(c) sum(lod <= c)))
+
+# How are the proteins spread over 10% bands? (is there a natural gap?)
+table(cut(lod, breaks = c(-1, 0, seq(10, 100, by = 10)),
+          labels = c("0%", paste0(seq(0, 90, 10), "-", seq(10, 100, 10), "%"))))
+```
+
+**Reading this:** 988 proteins are never below the LOD, but between 20% and 100% every 10% band holds roughly 20–40 proteins. **There is no natural gap**, so the choice of cut-off matters: > 25% removes 236 proteins, > 75% only 68. The paper's Methods do not state an LOD cut-off, so the choice has to be argued (below).
+
+**What the code does (example):** histograms of two proteins mostly below the LOD next to two that are always detected.
+
+```{r lod-examples, fig.height = 3.4}
+show <- c("IL5", "IL13", "CCL5", "ABL1")
+data.frame(npx[, show], check.names = FALSE) %>%
+  pivot_longer(everything(), names_to = "protein", values_to = "npx") %>%
+  mutate(protein = factor(paste0(protein, " (", ann[protein, "pct_below_lod"], "% < LOD)"),
+                          levels = paste0(show, " (", ann[show, "pct_below_lod"], "% < LOD)"))) %>%
+  ggplot(aes(npx)) + geom_histogram(bins = 50, fill = pal[1], color = "white") +
+  facet_wrap(~ protein, nrow = 1, scales = "free") +
+  labs(title = "Proteins mostly below the LOD are noisy and produce extreme values (left two)", x = "NPX", y = "samples")
+```
+
+```{r lod-filter}
+keep <- lod <= 50
+Xf <- X[, keep]
+removed_lod <- colnames(X)[!keep]
+cat("removed:", length(removed_lod), "| kept:", ncol(Xf), "\n")
+```
+
+**Decision:** remove proteins with **> 50%** of samples below the LOD: **150 removed, 1322 kept**. The arguments:
+
+1. **Majority rule:** every kept protein has a real measurement in at least half of the samples, so its median is a real value, not noise.
+2. **Design argument:** the age groups are close to half/half (450 vs 417 samples). A protein detectable in only one age group is below the LOD in about 50% of samples. 50% is the strictest cut-off that still keeps such a protein; a stricter one (25%, 40%) would remove exactly the proteins with the largest group differences.
+3. **A looser cut-off** (75%) keeps proteins measured in only a quarter of the samples: mostly noise, and more tests to correct for in part 3.
+4. **Label-independent:** the filter uses only the LOD, no group labels, so it does not favour any later hypothesis (required in part 3). The most extreme values in the file (IL5 up to +14, IL13 up to +12) disappear with it.
+
+**Limitation:** because there is no natural gap, results may depend on the cut-off. Planned check: repeat the part 3 analysis at 25% and 75%.
+
+# Step 6 — Sample quality
+
+**Why:** a failed sample (bad tube, failed well) shows up as many proteins below the LOD, many missing values, or a shifted overall level.
+
+**What the code does**
+
+- Two histograms of the per-sample quality columns in the metadata (`pct_below_lod`, `n_missing_npx`). A bad sample would be an isolated bar far to the right.
+- `apply(Xf, 1, median, na.rm = TRUE)` computes, for every sample (`1` = per row), the median NPX over all kept proteins; plotted per batch.
+
+```{r sample-qc, fig.height = 3.6}
+q1 <- ggplot(meta, aes(pct_below_lod)) + geom_histogram(bins = 30, fill = pal[1], color = "white") +
+  labs(title = "A  % of proteins below LOD", x = "% per sample", y = "samples")
+q2 <- ggplot(meta, aes(n_missing_npx)) + geom_bar(fill = pal[1]) +
+  labs(title = "B  Missing values reported", x = "n_missing_npx", y = "samples")
+q3 <- data.frame(median_npx = apply(Xf, 1, median, na.rm = TRUE), batch = batch) %>%
+  ggplot(aes(batch, median_npx)) + geom_boxplot(fill = pal[1], alpha = 0.25, outlier.size = 0.8) +
+  labs(title = "C  Median NPX per sample", x = NULL, y = "median NPX") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+q1 | q2 | q3
+summary(meta[, c("pct_below_lod", "n_missing_npx")])
+```
+
+**Reading this:** every sample has 4–18% of proteins below the LOD in one smooth distribution, and sample medians are similar across batches. No sample stands out.
+
+**Decision:** keep all **867 samples**. The PCA in step 7 is a second check.
+
+# Step 7 — Standardisation and PCA
+
+**Why:** slide 20 asks whether samples cluster by the **biology** we care about or by a **technical** factor. A PCA summarises all proteins in a few axes and shows the main sources of variation.
+
+**Normalised ≠ standardised.** The data are normalised (step 1) but **not standardised**: each protein still has its own mean and spread. For a PCA we standardise each protein (z-score: mean 0, SD 1), otherwise proteins with a large spread dominate. This is done **only for the PCA and heatmap**; the exported data stay in NPX.
+
+**What the code does**
+
+- `colSums(is.na(Xf)) == 0` keeps proteins without missing values (`prcomp()` cannot handle `NA`): 1322 − 19 = 1303 proteins.
+- `scale()` standardises each protein.
+- `prcomp()` computes the principal components; `pca$x` are each sample's coordinates (scores); `sdev^2 / sum(sdev^2)` is the % variance per component.
+
+```{r pca}
+Xp  <- Xf[, colSums(is.na(Xf)) == 0]
+Z   <- scale(Xp)
+pca <- prcomp(Z)
+ve  <- pca$sdev^2 / sum(pca$sdev^2) * 100
+S   <- cbind(as.data.frame(pca$x[, 1:3]), meta)
+cat("proteins in PCA:", ncol(Z), "| % variance PC1-5:", round(ve[1:5], 1), "\n")
+```
+
+**What the code does (plots):** a scree plot (variance per PC), then the same PCA scores coloured four ways. `pca_plot()` is a small helper so every panel is drawn the same way.
+
+```{r scree, fig.height = 3.2}
+data.frame(PC = 1:15, ve = ve[1:15]) %>%
+  ggplot(aes(PC, ve)) + geom_col(fill = pal[1], width = 0.7) +
+  geom_text(aes(label = round(ve, 1)), vjust = -0.4, size = 3) +
+  scale_x_continuous(breaks = 1:15) +
+  labs(title = "Scree plot: PC1 captures a quarter of all variation", x = "principal component", y = "% variance")
+```
+
+```{r pca-plots, fig.height = 8.5}
+pca_plot <- function(df, col, title, ve, x = "PC1", y = "PC2", cols = pal) {
+  df$grp <- factor(df[[col]])
+  ggplot(df, aes(.data[[x]], .data[[y]], color = grp)) +
+    geom_point(size = 1.4, alpha = 0.75) +
+    scale_color_manual(values = cols, name = NULL) +
+    labs(title = title,
+         x = sprintf("%s (%.1f%%)", x, ve[as.integer(sub("PC", "", x))]),
+         y = sprintf("%s (%.1f%%)", y, ve[as.integer(sub("PC", "", y))])) +
+    guides(color = guide_legend(override.aes = list(size = 3, alpha = 1), nrow = 2))
+}
+(pca_plot(S, "olink_batch_id", "A  Olink batch", ve) | pca_plot(S, "subject.ageGroup", "B  Age group", ve, cols = age_cols)) /
+(pca_plot(S, "subject.biologicalSex", "C  Sex", ve, cols = sex_cols) | pca_plot(S, "cmv_status", "D  CMV status", ve, cols = cmv_cols)) +
+  plot_annotation(title = "Samples cluster by batch, not by age, sex or CMV")
+```
+
+**Putting a number on it: η² (eta squared).** The share of the variation on one PC explained by a grouping variable: spread of the group means divided by the total spread (like R² in an ANOVA). 0 = no difference between groups, 1 = all variation is between groups. `ave(x, g)` gives each sample its group mean.
+
+```{r eta2, fig.height = 3.6}
+eta2 <- function(x, g) { m <- ave(x, g); sum((m - mean(x))^2) / sum((x - mean(x))^2) }
+factors <- c(batch = "olink_batch_id", plate = "olink_plate_id", `age group` = "subject.ageGroup",
+             sex = "subject.biologicalSex", CMV = "cmv_status", visit = "sample.visitName",
+             donor = "subject.subjectGuid")
+eta_table <- function(S) {
+  expand.grid(factor = names(factors), PC = c("PC1", "PC2", "PC3"), stringsAsFactors = FALSE) %>%
+    rowwise() %>% mutate(eta2 = eta2(S[[PC]], S[[factors[[factor]]]])) %>% ungroup() %>%
+    mutate(factor = factor(factor, levels = rev(names(factors))))
+}
+eta_plot <- function(et, title) {
+  ggplot(et, aes(PC, factor, fill = eta2)) + geom_tile(color = "white", linewidth = 1) +
+    geom_text(aes(label = sprintf("%.2f", eta2), color = eta2 > 0.4), size = 3.6, show.legend = FALSE) +
+    scale_color_manual(values = c(`TRUE` = "white", `FALSE` = "black")) +
+    scale_fill_gradient(low = "#f2f2f2", high = pal[1], limits = c(0, 1), name = "eta²") +
+    labs(title = title, x = NULL, y = NULL)
+}
+eta_plot(eta_table(S), "Share of each PC explained by each factor (eta²)")
+```
+
+**What the code does (heatmap):** the 100 proteins with the highest variance, standardised and capped at ±3 SD; samples ordered by batch, proteins ordered by hierarchical clustering. The strip on top shows batch and age group.
+
+```{r heatmap, fig.height = 7.2}
+top <- names(sort(apply(Xp, 2, var), decreasing = TRUE))[1:100]
+H <- scale(Xp[, top]); H[H > 3] <- 3; H[H < -3] <- -3
+prot_order <- top[hclust(as.dist(1 - cor(H)))$order]
+samp_order <- rownames(H)[order(batch, meta$subject.ageGroup)]
+
+hm <- as.data.frame(H) %>% mutate(sample = rownames(H)) %>%
+  pivot_longer(-sample, names_to = "protein", values_to = "z") %>%
+  mutate(sample = factor(sample, levels = samp_order), protein = factor(protein, levels = prot_order)) %>%
+  ggplot(aes(sample, protein, fill = z)) + geom_raster() +
+  scale_fill_gradient2(low = "#2b6cb0", mid = "#f7f7f7", high = "#c0392b", name = "z-score") +
+  labs(x = "samples (ordered by batch, then age group)", y = "100 most variable proteins") +
+  theme(axis.text = element_blank(), panel.grid = element_blank(), legend.position = "right")
+
+ann_cols <- c(setNames(pal, sort(unique(batch))), `Older Adult` = "#555555", `Young Adult` = "#c8c8c8")
+strip <- data.frame(sample = factor(samp_order, levels = samp_order),
+                    batch = batch[match(samp_order, meta$sample_kit_id)],
+                    age = meta$subject.ageGroup[match(samp_order, meta$sample_kit_id)]) %>%
+  pivot_longer(-sample) %>%
+  ggplot(aes(sample, name, fill = value)) + geom_raster() +
+  scale_fill_manual(values = ann_cols, name = NULL, breaks = names(ann_cols)) +
+  guides(fill = guide_legend(nrow = 2)) +
+  labs(x = NULL, y = NULL, title = "Standardised heatmap: colour blocks follow the batches") +
+  theme(axis.text.x = element_blank(), panel.grid = element_blank(), legend.position = "top")
+
+strip / hm + plot_layout(heights = c(0.12, 1))
+```
+
+**Reading this (main finding of part 1)**
+
+- **Batch explains ~70% of PC1 and PC2**; plate adds nothing beyond batch. The heatmap shows the same: blocks of colour line up with the batches.
+- **Age group explains ~1% of PC1 and ~13% of PC2**; sex, CMV and visit ≈ 0%.
+- **Donor explains 25–45%**: samples of the same person resemble each other (pseudoreplication, visible in the data).
+
+Even after the producer's normalisation, a strong **batch effect** remains: it is the largest source of variation in the data.
+
+*To verify (beyond the course material):* the proteins loading highest on PC1 are mostly intracellular (e.g. MIF, PEBP1, GLOD4, CIAPIN1). In Olink plasma data such a group often reflects sample handling (cell contents leaking into plasma) rather than biology.
+
+```{r loadings}
+head(sort(pca$rotation[, 1], decreasing = TRUE), 10)
+```
+
+# Step 8 — Batch effect and confounding: what now?
+
+**Why:** a batch effect is only harmless if batch is independent of the groups we want to compare. If it is not, a group difference can partly be a batch difference (confounding, lesson 1).
+
+**What the code does:** the share of young and older samples per batch (`position = "fill"` makes each bar 100%; dashed line = overall share), and a table of batch × draw year.
+
+```{r confounding, fig.height = 3.6}
+meta %>% count(olink_batch_id, subject.ageGroup) %>%
+  ggplot(aes(olink_batch_id, n, fill = subject.ageGroup)) +
+  geom_col(position = "fill", width = 0.7) +
+  geom_hline(yintercept = mean(meta$subject.ageGroup == "Young Adult"), linetype = "dashed") +
+  scale_y_continuous(labels = percent) + scale_fill_manual(values = age_cols, name = NULL) +
+  labs(title = "Age groups are not evenly spread over batches", x = "Olink batch", y = "share of samples")
+table(batch = meta$olink_batch_id, draw_year = meta$sample.drawYear)
+```
+
+**Reading this:** batch 20201752 is 76% young, batch 20211036 64% older; batches also follow draw year. So batch is **partly confounded with age** (and with time).
+
+**Check: what is left after removing the batch means?**
+
+**What the code does:** `z - ave(z, batch)` subtracts, per protein, the mean of each sample's own batch, so all batches are centred at 0. Then the same PCA and η².
+
+```{r centred, fig.height = 7.5}
+Zc    <- apply(Z, 2, \(z) z - ave(z, batch))
+pca_c <- prcomp(Zc)
+vec   <- pca_c$sdev^2 / sum(pca_c$sdev^2) * 100
+Sc    <- cbind(as.data.frame(pca_c$x[, 1:3]), meta)
+
+(pca_plot(Sc, "olink_batch_id", "A  After batch centring: batch", vec) |
+ pca_plot(Sc, "subject.ageGroup", "B  After batch centring: age group", vec, cols = age_cols)) /
+(eta_plot(eta_table(S), "C  eta² before centring") | eta_plot(eta_table(Sc), "D  eta² after centring")) +
+  plot_layout(heights = c(1.3, 1))
+```
+
+**Reading this:** after centring, batch explains 0%, age group explains **~25% of PC2**, and donor 50–80%. So there is an age signal in the proteome, hidden behind the batch effect in the raw data.
+
+**Decision: how to handle batch in parts 2–4**
+
+| Use | How to handle batch | Why |
+|---|---|---|
+| Figures (PCA, heatmap) | batch-centred or `limma::removeBatchEffect()` is fine | only for looking |
+| Statistical tests (parts 2–3) | **batch as a covariate** in the model, on uncorrected NPX, e.g. `NPX ~ group + covariates + batch` | the model estimates batch and the effect of interest together, so the uncertainty and the confounding are taken into account |
+| Machine learning (part 4) | any correction or scaling fitted on the **training set only** | otherwise test-set information leaks into training |
+
+Correcting the data first and then testing on it has two problems: the test does not know that batch effects were estimated (p-values too small), and because batch and age are confounded, the correction removes part of the real age effect, or, if age is "protected" in the correction, the later age test becomes circular. The limma documentation itself states that `removeBatchEffect()` is meant for plotting, not as input for tests.
+
+# Step 9 — Summary and output files
+
+**What the code does**
+
+- `npx_clean.csv`: the filtered matrix (merged names + LOD filter). **NPX scale, not standardised, not batch-corrected, `NA` kept.** First column = `sample_kit_id`.
+- `metadata_clean.csv`: the metadata in the same sample order, with the donor median BMI added (`bmi_donor_median`).
+- `removed_proteins.csv`: every removed protein and the reason, for the Methods section.
+- In R, convert categorical columns with `factor()` when you load the metadata later (e.g. batch, sex, CMV, age group); written to CSV they become text again.
+
+```{r save}
+stopifnot(all(rownames(Xf) == meta$sample_kit_id))
+
+write_csv(data.frame(sample_kit_id = rownames(Xf), Xf, check.names = FALSE), "npx_clean.csv")
+
+meta_clean <- meta
+meta_clean$bmi_donor_median <- as.numeric(bmi_donor[meta$subject.subjectGuid])
+write_csv(meta_clean, "metadata_clean.csv")
+
+removed <- rbind(
+  data.frame(protein = names(old_to_new), reason = paste("merged into", old_to_new)),
+  data.frame(protein = removed_lod, reason = "> 50% of samples below LOD"))
+write_csv(removed, "removed_proteins.csv")
+
+cat("npx_clean.csv:", nrow(Xf), "samples x", ncol(Xf), "proteins\n")
+table(removed$reason == "> 50% of samples below LOD")
+```
+
+| Step | Decision | Effect |
+|---|---|---|
+| Loading | read CSVs in R, not Excel | values correct |
+| Design | 96 donors, ~9 samples each | handle repeated samples per analysis |
+| Renamed assays | merge 9 old/new name pairs | 1481 → 1472 proteins |
+| Batch-wise missing values | not imputed (MAR on batch) | `NA` kept in 21 proteins |
+| LOD filter | > 50% below LOD removed, label-independent | 1472 → 1322 proteins |
+| Sample QC | no outliers | 867 samples kept |
+| Normalisation / log2 | already done by the producer | not repeated |
+| Standardisation | only for PCA and heatmap | exported data in NPX |
+| Batch effect | strong, partly confounded with age | covariate in models; correction only for figures |
+
+**Is the dataset suitable for parts 2–4?** Yes, provided each analysis (1) includes batch as a covariate (or corrects only within the training set for ML) and (2) handles the repeated samples per donor (one time point, donor averages, or a mixed model).
+
+# Notes on alternative choices
+
+These choices were considered and not used; worth knowing for the defence.
+
+- **Removing both names of the duplicate pairs** instead of merging: loses 8 real proteins (ADGRE5, CCN4, CCN5, CEP20, DARS1, GOLM2, HARS1, IRAG2), because the two names are complementary halves of one assay.
+- **k-NN or mean imputation** of the remaining `NA`: the missing values are whole batches, not scattered gaps, so imputed values would be invented and would carry that batch's shift.
+- **Exporting batch-corrected and z-scored data** as input for tests: makes p-values too optimistic, can remove or protect effects depending on the correction design, loses the NPX scale (coefficients in SD units instead of log2 units), and causes data leakage if used before a train/test split.
+- **A different LOD cut-off** (25% or 75%): defensible too; the sensitivity table in step 5 shows how many proteins each removes. There is no natural gap in the LOD distribution and the paper states no cut-off, so 50% rests on the arguments in step 5, with a sensitivity check in part 3.
+
+```{r session, include=FALSE}
+sessionInfo()
+```
